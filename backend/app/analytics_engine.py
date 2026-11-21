@@ -664,6 +664,131 @@ def compute_confidence_interval(
 
 
 # ---------------------------------------------------------------------------
+# 实验覆盖数据集（按时段的对照组/实验组覆盖视图）
+# ---------------------------------------------------------------------------
+
+COVERAGE_BOTH = "共同覆盖"
+COVERAGE_CONTROL_ONLY = "仅对照组"
+COVERAGE_TREATMENT_ONLY = "仅实验组"
+
+
+def compute_coverage_dataset(
+    control_samples: list[dict[str, Any]],
+    treatment_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """从对照组和实验组样本计算实验覆盖数据集。
+
+    样本格式：{"period": "2026-11-21 上午", "value": 0.42}，时段按首次出现顺序保留。
+    返回共同覆盖与仅单组有值的区间清单，供覆盖视图、可比口径计算和监控联动共用。
+    """
+    periods: dict[str, dict[str, list[float]]] = {}
+    for group_key, samples in (("control", control_samples), ("treatment", treatment_samples)):
+        for sample in samples:
+            period = str(sample.get("period", "")).strip()
+            if not period:
+                continue
+            bucket = periods.setdefault(period, {"control": [], "treatment": []})
+            try:
+                bucket[group_key].append(float(sample.get("value")))
+            except (TypeError, ValueError):
+                continue
+
+    intervals: list[dict[str, Any]] = []
+    for period, bucket in periods.items():
+        control_values = bucket["control"]
+        treatment_values = bucket["treatment"]
+        if control_values and treatment_values:
+            coverage = COVERAGE_BOTH
+        elif control_values:
+            coverage = COVERAGE_CONTROL_ONLY
+        else:
+            coverage = COVERAGE_TREATMENT_ONLY
+        intervals.append({
+            "period": period,
+            "coverage": coverage,
+            "control_count": len(control_values),
+            "treatment_count": len(treatment_values),
+            "control_values": control_values,
+            "treatment_values": treatment_values,
+        })
+
+    return {
+        "dataset": "实验覆盖数据集",
+        "intervals": intervals,
+        "common_periods": [i["period"] for i in intervals if i["coverage"] == COVERAGE_BOTH],
+        "control_only_periods": [i["period"] for i in intervals if i["coverage"] == COVERAGE_CONTROL_ONLY],
+        "treatment_only_periods": [i["period"] for i in intervals if i["coverage"] == COVERAGE_TREATMENT_ONLY],
+    }
+
+
+def coverage_exclusions(coverage: dict[str, Any]) -> list[dict[str, Any]]:
+    """为共同覆盖区间外的样本生成排除原因（区间外的尖峰等不进入当前结论）。"""
+    exclusions: list[dict[str, Any]] = []
+    for interval in coverage.get("intervals", []):
+        coverage_type = interval.get("coverage")
+        if coverage_type == COVERAGE_BOTH:
+            continue
+        if coverage_type == COVERAGE_TREATMENT_ONLY:
+            excluded_group, missing_group = "实验组", "对照组"
+            values = interval.get("treatment_values", [])
+        else:
+            excluded_group, missing_group = "对照组", "实验组"
+            values = interval.get("control_values", [])
+        exclusions.append({
+            "period": interval.get("period"),
+            "coverage": coverage_type,
+            "excluded_group": excluded_group,
+            "excluded_count": len(values),
+            "excluded_values": values,
+            "reason": f"{interval.get('period')}仅{excluded_group}有值，{missing_group}缺失，按可比口径排除",
+        })
+    return exclusions
+
+
+def compute_effect_with_coverage(
+    coverage: dict[str, Any], confidence: float = 0.95,
+) -> dict[str, Any]:
+    """按可比口径重算实验效果：仅共同覆盖区间的样本进入计算。
+
+    结果带采样覆盖（共同覆盖时段、入算样本量）和排除原因，
+    与监控接口共用同一批有效时段。
+    """
+    common_intervals = [
+        i for i in coverage.get("intervals", []) if i.get("coverage") == COVERAGE_BOTH
+    ]
+    control_values = [v for i in common_intervals for v in i.get("control_values", [])]
+    treatment_values = [v for i in common_intervals for v in i.get("treatment_values", [])]
+
+    effect = compute_confidence_interval(control_values, treatment_values, confidence)
+    sampling_coverage = {
+        "common_periods": [i["period"] for i in common_intervals],
+        "common_period_count": len(common_intervals),
+        "total_periods": len(coverage.get("intervals", [])),
+        "included_control_count": len(control_values),
+        "included_treatment_count": len(treatment_values),
+    }
+    return {
+        "effect": effect,
+        "sampling_coverage": sampling_coverage,
+        "exclusions": coverage_exclusions(coverage),
+    }
+
+
+def common_coverage_series(coverage: dict[str, Any]) -> list[dict[str, Any]]:
+    """提取共同覆盖区间内两组的有效样本序列（带时段标签），供监控接口使用。"""
+    series: list[dict[str, Any]] = []
+    for interval in coverage.get("intervals", []):
+        if interval.get("coverage") != COVERAGE_BOTH:
+            continue
+        period = interval.get("period")
+        for value in interval.get("control_values", []):
+            series.append({"period": period, "group": "对照组", "value": value})
+        for value in interval.get("treatment_values", []):
+            series.append({"period": period, "group": "实验组", "value": value})
+    return series
+
+
+# ---------------------------------------------------------------------------
 # 下钻路径计算
 # ---------------------------------------------------------------------------
 

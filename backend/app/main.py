@@ -251,6 +251,54 @@ def governance_pipeline(
     }
 
 
+# ---- 数据流6: 实验覆盖视图 → 可比口径效果 → 监控联动 ----
+@app.get("/api/analytics/ab-analysis/{experiment_id}/coverage")
+def ab_coverage_view(experiment_id: int) -> dict[str, Any]:
+    """实验覆盖视图：按时段列出共同覆盖和仅单组有值的区间。"""
+    svc = service_for("ab_analysis")
+    if svc is None:
+        return {"ok": False, "message": "实验分析服务未就绪"}
+    return svc.coverage_view(experiment_id)
+
+
+@app.post("/api/analytics/ab-analysis/{experiment_id}/observations")
+def ab_add_observations(experiment_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """补入观测记录（如下午的对照组），返回重算后的覆盖视图。"""
+    svc = service_for("ab_analysis")
+    if svc is None:
+        return {"ok": False, "message": "实验分析服务未就绪"}
+    return svc.add_observations(
+        experiment_id,
+        group=str(payload.get("group", "")),
+        period=str(payload.get("period", "")),
+        values=list(payload.get("values") or []),
+    )
+
+
+@app.post("/api/analytics/ab-analysis/{experiment_id}/effect")
+def ab_effect_with_coverage(experiment_id: int) -> dict[str, Any]:
+    """按可比口径重算实验效果：共同覆盖区间进入结论，结果带采样覆盖和排除原因。"""
+    svc = service_for("ab_analysis")
+    if svc is None:
+        return {"ok": False, "message": "实验分析服务未就绪"}
+    return svc.analyze_with_coverage(experiment_id)
+
+
+@app.post("/api/analytics/anomaly-detect/coverage-scan")
+def anomaly_coverage_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    """监控接口：接收实验覆盖数据集，共同覆盖区间用于异常规则。"""
+    svc = service_for("anomaly_detect")
+    if svc is None:
+        return {"ok": False, "message": "异常检测服务未就绪"}
+    coverage_dataset = payload.get("coverage_dataset")
+    if not isinstance(coverage_dataset, dict) or not coverage_dataset.get("intervals"):
+        return {"ok": False, "message": "缺少实验覆盖数据集（coverage_dataset.intervals）"}
+    rule_ids = payload.get("rule_ids")
+    if not rule_ids:
+        rule_ids = [int(r["id"]) for r in svc.get_active_rules()]
+    return svc.detect_with_coverage([int(rid) for rid in rule_ids], coverage_dataset)
+
+
 # ----  天平 ----
 @app.get("/api/analytics/lineage/{node_id}/upstream")
 def lineage_upstream(node_id: str) -> dict[str, Any]:

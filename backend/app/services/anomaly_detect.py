@@ -9,6 +9,8 @@ from app.analytics_engine import (
     detect_anomalies_zscore,
     detect_anomalies_iqr,
     detect_anomalies_moving_avg,
+    common_coverage_series,
+    coverage_exclusions,
 )
 
 
@@ -87,6 +89,50 @@ class AnomalyDetectService(BaseModuleService):
             row for row in store.rows(self.MODULE)
             if row.get("status") == "监控中"
         ]
+
+    def detect_with_coverage(
+        self, rule_ids: list[int], coverage_dataset: dict[str, Any],
+    ) -> dict[str, Any]:
+        """监控接口：接收实验覆盖数据集，把共同覆盖区间用于异常规则。
+
+        只对共同覆盖区间内的样本执行检测，判定用的有效时段与实验结果
+        保持一致；区间外的样本（如缺对照组时段的尖峰）记录排除原因，不参与判定。
+        """
+        series = common_coverage_series(coverage_dataset)
+        values = [point["value"] for point in series]
+        valid_periods = list(coverage_dataset.get("common_periods", []))
+        exclusions = coverage_exclusions(coverage_dataset)
+
+        results: list[dict[str, Any]] = []
+        for rid in rule_ids:
+            rule = store.find(self.MODULE, rid)
+            if rule is None:
+                continue
+            report = self.detect(rid, values)
+            if not report.get("ok"):
+                continue
+            # 把异常下标映射回时段和组别，保证结论可核对到具体区间
+            for anomaly in report.get("anomalies", []):
+                idx = anomaly.get("index")
+                if isinstance(idx, int) and 0 <= idx < len(series):
+                    anomaly["period"] = series[idx]["period"]
+                    anomaly["group"] = series[idx]["group"]
+            report["valid_periods"] = valid_periods
+            results.append(report)
+
+        return {
+            "ok": True,
+            "dataset": "实验覆盖数据集",
+            "valid_periods": valid_periods,
+            "sampling_coverage": {
+                "common_periods": valid_periods,
+                "included_count": len(values),
+            },
+            "exclusions": exclusions,
+            "rule_count": len(rule_ids),
+            "total_anomalies": sum(r.get("anomaly_count", 0) for r in results),
+            "results": results,
+        }
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
